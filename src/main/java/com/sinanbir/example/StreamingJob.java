@@ -18,7 +18,23 @@
 
 package com.sinanbir.example;
 
+import com.sinanbir.stream.FilterStreamParser;
+import com.sinanbir.stream.JoinProcessFunction;
+import com.sinanbir.stream.WordStreamParser;
+import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.api.java.utils.ParameterTool;
+import org.apache.flink.contrib.streaming.state.RocksDBStateBackend;
+import org.apache.flink.streaming.api.CheckpointingMode;
+import org.apache.flink.streaming.api.TimeCharacteristic;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.windowing.assigners.SlidingProcessingTimeWindows;
+import org.apache.flink.streaming.api.windowing.time.Time;
+
+import java.time.LocalDateTime;
 
 /**
  * Skeleton for a Flink Streaming Job.
@@ -32,33 +48,53 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
  * <p>If you change the name of the main class (with the public static void main(String[] args))
  * method, change the respective entry in the POM.xml file (simply search for 'mainClass').
  */
-public class StreamingJob {
+public class StreamingJob{
 
-	public static void main(String[] args) throws Exception {
-		// set up the streaming execution environment
+	public static void main(String[] args) throws Exception{
+
+		final ParameterTool params = ParameterTool.fromArgs(args);
+		int portWordStream = params.getInt("portStream");
+		int portFilterStream = params.getInt("portFilterStream");
+		int portSink = params.getInt("portSink");
+		String stateDir = params.get("stateDir");
+		String socketHost = params.get("host");
+
 		final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+		env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime);
+		env.setStateBackend(new RocksDBStateBackend(stateDir, false));
+		env.enableCheckpointing(2000);// start a checkpoint every 2seconds
+		CheckpointConfig config = env.getCheckpointConfig();
+		config.setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);// set mode to exactly-once (this is the default)
+		config.enableExternalizedCheckpoints(CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
 
-		/*
-		 * Here, you can start creating your execution plan for Flink.
-		 *
-		 * Start with getting some data from the environment, like
-		 * 	env.readTextFile(textPath);
-		 *
-		 * then, transform the resulting DataStream<String> using operations
-		 * like
-		 * 	.filter()
-		 * 	.flatMap()
-		 * 	.join()
-		 * 	.coGroup()
-		 *
-		 * and many more.
-		 * Have a look at the programming guide for the Java API:
-		 *
-		 * http://flink.apache.org/docs/latest/apis/streaming/index.html
-		 *
-		 */
+		DataStream<Tuple2<String,Integer>> wordStream = env
+				.socketTextStream(socketHost, portWordStream).name("Word Stream")
+				.setParallelism(1)
+				.flatMap(new WordStreamParser()).name("Word FlatMap")
+				.keyBy(0);
+
+		DataStream<Tuple2<String,Boolean>> filterStream = env
+				.socketTextStream(socketHost, portFilterStream).name("Filter Stream")
+				.setParallelism(1)
+				.flatMap(new FilterStreamParser()).name("Filter FlatMap")
+				.keyBy(0);
+
+		DataStream<Tuple2<String,Integer>> joinedStream = wordStream
+				.connect(filterStream)
+				.process(new JoinProcessFunction()).setParallelism(5).uid("join-1").name("Co-JoinProcess")
+				.keyBy(0)
+				.window(SlidingProcessingTimeWindows.of(Time.seconds(5), Time.seconds(1)))
+				.sum(1).name("Summarize")
+				.setParallelism(5);
+
+		joinedStream.map((MapFunction<Tuple2<String,Integer>,String>)input -> String.format("%tT | %s Count: %d\n", LocalDateTime.now(), input.f0, input.f1))
+				.returns(String.class)
+				.writeToSocket(socketHost, portSink, new SimpleStringSchema())
+				.setParallelism(1)
+				.name("Socket Output");
+
 
 		// execute program
-		env.execute("Flink Streaming Java API Skeleton");
+		env.execute("Flink Streaming Stateful Java Example");
 	}
 }
